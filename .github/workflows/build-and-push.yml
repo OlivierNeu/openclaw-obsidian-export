@@ -90,9 +90,11 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Smoke-test pushed image
-        env:
-          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
         run: |
+          # Docker / GHCR require lowercase image names; the org name
+          # "OlivierNeu" contains capitals, so we explicitly downcase.
+          IMAGE_REF=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" | tr '[:upper:]' '[:lower:]')
+          echo "Smoke-testing $IMAGE_REF"
           docker pull "$IMAGE_REF"
           # 1. Binary is present and reports its version.
           docker run --rm "$IMAGE_REF" obsidian-export --version
