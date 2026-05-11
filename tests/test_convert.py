@@ -91,5 +91,18 @@ def test_empty_file_is_400() -> None:
     assert resp.status_code == 400
 
 
+def test_bad_frontmatter_falls_back_instead_of_500() -> None:
+    """obsidian-export refuses malformed YAML frontmatter (plain text between
+    --- markers). The sidecar must fall back to the raw source instead of
+    propagating a 500 to the n8n pipeline."""
+    data = _post("note-bad-frontmatter.md")
+    assert data["stats"]["fallback_used"] is True
+    assert "obsidian-export failed" in (data.get("warning") or "")
+    assert "frontmatter" in data["content"]  # raw source still indexable
+    assert "obsidian-export" in data["wikilinks_out"]
+    assert "#regression" in data["tags_inline"]
+    assert "#yaml-strict" in data["tags_inline"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-xvs"]))

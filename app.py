@@ -116,6 +116,7 @@ async def convert(
         src_file = vault_dir / safe_name
         src_file.write_bytes(raw)
 
+        fallback_reason: str | None = None
         try:
             subprocess.run(
                 [OBSIDIAN_EXPORT_BIN, str(vault_dir), str(out_dir)],
@@ -125,20 +126,42 @@ async def convert(
                 check=True,
             )
         except subprocess.CalledProcessError as exc:
-            log.error("obsidian-export failed: stderr=%s", exc.stderr)
-            raise HTTPException(
-                status_code=500,
-                detail=f"obsidian-export failed: {exc.stderr or exc.stdout or 'unknown error'}",
-            ) from exc
+            # obsidian-export refuses some real-world inputs from human-edited
+            # vaults — most commonly malformed YAML frontmatter (e.g. plain
+            # text between --- markers instead of a key:value mapping). Rather
+            # than failing the whole pipeline item, fall back to the source
+            # markdown so the document is still ingested into LightRAG, just
+            # without CommonMark normalisation. Wikilink / frontmatter /
+            # tag extraction below still runs against the raw source.
+            # Extract the "Error:" block from stderr (which may be preceded
+            # by unrelated wikilink "Warning:" lines for orphan references).
+            stderr = exc.stderr or ""
+            error_lines = []
+            seen_error = False
+            for line in stderr.splitlines():
+                if line.startswith("Error:"):
+                    seen_error = True
+                if seen_error:
+                    error_lines.append(line)
+                    if len(error_lines) >= 4:
+                        break
+            error_block = " | ".join(error_lines) if error_lines else stderr.splitlines()[0] if stderr else "unknown error"
+            fallback_reason = ("obsidian-export failed: " + error_block)[:400]
+            log.warning(
+                "obsidian-export failed on %s (status=%s) — falling back to raw input. stderr=%s",
+                safe_name, exc.returncode, stderr[:300],
+            )
         except subprocess.TimeoutExpired as exc:
             raise HTTPException(status_code=504, detail="obsidian-export timed out") from exc
 
         out_file = out_dir / safe_name
         if not out_file.exists():
             # obsidian-export sometimes drops the file when its content is
-            # entirely filtered (e.g. only embeds with no resolution). Fall
-            # back to the original to keep ingestion deterministic.
-            log.warning("obsidian-export produced no output for %s — falling back to input", safe_name)
+            # entirely filtered (e.g. only embeds with no resolution) or when
+            # the converter aborted before writing. Fall back to the input.
+            if fallback_reason is None:
+                fallback_reason = "obsidian-export produced no output"
+                log.warning("obsidian-export produced no output for %s — falling back to input", safe_name)
             shutil.copy(src_file, out_file)
 
         converted_raw = out_file.read_text(encoding="utf-8")
@@ -161,11 +184,13 @@ async def convert(
             "frontmatter_text": fm_human,
             "wikilinks_out": wikilinks,
             "tags_inline": tags,
+            "warning": fallback_reason,
             "stats": {
                 "input_bytes": len(raw),
                 "output_bytes": len(converted.encode("utf-8")),
                 "wikilinks_count": len(wikilinks),
                 "tags_count": len(tags),
+                "fallback_used": fallback_reason is not None,
             },
         }
     )
