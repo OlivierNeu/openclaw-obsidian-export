@@ -16,13 +16,25 @@ LABEL org.opencontainers.image.source="https://github.com/olivierneu/openclaw-ob
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.base.name="python:3.12-slim"
 
-# Install runtime deps (curl for healthcheck only, kept lean).
+# Install runtime deps.
+#  - curl   : healthcheck
+#  - xz-utils: extract the obsidian-export tarball (purged after)
+#  - pandoc  : epub -> GitHub-flavoured markdown conversion (/convert-epub).
+#    Debian bookworm ships pandoc 2.17.x which converts epub correctly.
+#    Pinned-static-deb upgrade path left for later if a newer pandoc is
+#    ever required (keeps the build reproducible without a guessed URL).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
       xz-utils \
+      pandoc \
  && rm -rf /var/lib/apt/lists/*
+
+# Pandoc + a POSIX locale mangles Unicode CLI args (U+FFFD). Force a
+# UTF-8 locale process-wide so epub titles/paths round-trip correctly.
+ENV LC_ALL=C.UTF-8 \
+    LANG=C.UTF-8
 
 # Download the official obsidian-export Rust binary from GitHub Releases.
 # Only x86_64-unknown-linux-gnu is published upstream; ARM64 builds would

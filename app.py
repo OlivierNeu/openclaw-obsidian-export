@@ -28,10 +28,13 @@ GET /health     liveness probe (always 200 if the process is up and the
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -40,12 +43,31 @@ import datetime as _dt
 import frontmatter
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
+from pypdf import PdfReader
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("obsidian-export-svc")
 
 OBSIDIAN_EXPORT_BIN = "/usr/local/bin/obsidian-export"
+PANDOC_BIN = "pandoc"
 MAX_INPUT_BYTES = 10 * 1024 * 1024  # 10 MB — Obsidian notes are tiny in practice
+# epub reference books (Watzlawick, Mouravieff, ...) are much larger than a
+# note and may embed images. Allow up to 80 MB (Flatten caps Drive at 100 MB).
+MAX_EPUB_BYTES = 80 * 1024 * 1024
+MAX_PDF_BYTES = 100 * 1024 * 1024
+# Sample at most this many pages for the routing heuristic — extract_text /
+# page.images on a 500-page book is slow and unnecessary just to decide a
+# route. Pages are sampled EVENLY across the whole document (not the first
+# N): a long PDF with a textual cover/TOC and figures only after page 30
+# must still be seen as figure-rich.
+PDF_STATS_SAMPLE_PAGES = 40
+# Route to Mistral only when images are DENSE per page (figures/diagrams the
+# RAG must interpret). A scanned document is ≈1 full-page image per page —
+# that is NOT this case: docling+OCR handles scans locally for free. Using a
+# per-page density (not a raw count) is what distinguishes a figure-rich deck
+# from a long scanned book. Tunable; the n8n IF can override using the raw
+# numbers returned alongside `recommend`.
+MISTRAL_IMAGES_PER_PAGE_THRESHOLD = 2.5
 
 # Inline wikilinks like [[Target]], [[Target|alias]], or embeds ![[Target]].
 # We strip the optional "#heading" or "^block" fragment from the target so we
@@ -194,6 +216,219 @@ async def convert(
             },
         }
     )
+
+
+@app.post("/convert-epub")
+async def convert_epub(
+    file: UploadFile = File(...),
+    filename: str | None = Form(default=None),
+) -> JSONResponse:
+    """Convert an .epub book to GitHub-flavoured markdown via pandoc.
+
+    Returns the SAME JSON contract as /convert so the n8n markdown branch
+    (Prepare LightRAG (md)) can consume epub and Obsidian notes uniformly.
+    Replaces the broken epub -> Gotenberg/LibreOffice -> PDF -> OCR path
+    (LibreOffice mangles epub into a 1-page stub with no text layer).
+    """
+    raw = await file.read()
+    if len(raw) > MAX_EPUB_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"epub too large: {len(raw)} bytes > {MAX_EPUB_BYTES}",
+        )
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty file")
+
+    with tempfile.TemporaryDirectory(prefix="epub_") as tmp:
+        tmp_path = Path(tmp)
+        src = tmp_path / "book.epub"  # ASCII path: Unicode title stays out of argv
+        out = tmp_path / "out.md"
+        src.write_bytes(raw)
+
+        # Force a UTF-8 locale for the child too (belt-and-braces with the
+        # image-level ENV) so accented book titles round-trip.
+        env = {**os.environ, "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8"}
+        try:
+            proc = subprocess.run(
+                [
+                    PANDOC_BIN,
+                    str(src),
+                    "-f", "epub",
+                    "-t", "gfm",
+                    "--wrap=none",
+                    "--markdown-headings=atx",
+                    "-o", str(out),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                env=env,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip().splitlines()
+            detail = " | ".join(stderr[:4]) if stderr else "pandoc failed"
+            log.warning("pandoc epub conversion failed: %s", detail)
+            raise HTTPException(
+                status_code=422, detail=f"pandoc epub conversion failed: {detail}"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise HTTPException(
+                status_code=504, detail="pandoc epub conversion timed out"
+            ) from exc
+
+        if not out.exists():
+            raise HTTPException(
+                status_code=422, detail="pandoc produced no output for this epub"
+            )
+        content = out.read_text(encoding="utf-8", errors="replace").strip()
+
+    if not content:
+        # A valid-looking epub that yields no text (DRM, images-only, broken
+        # container) is useless for the RAG — fail loud so the n8n pipeline
+        # counts it and the post-Save-Token alert surfaces it.
+        raise HTTPException(
+            status_code=422,
+            detail="epub converted to empty markdown (no extractable text)",
+        )
+
+    fm_data, fm_human = _epub_metadata(raw)
+
+    return JSONResponse(
+        {
+            "content": content,
+            "frontmatter": fm_data,
+            "frontmatter_text": fm_human,
+            "wikilinks_out": [],   # epub has no Obsidian wikilinks
+            "tags_inline": [],     # epub has no Obsidian inline tags
+            "warning": None,
+            "stats": {
+                "input_bytes": len(raw),
+                "output_bytes": len(content.encode("utf-8")),
+                "wikilinks_count": 0,
+                "tags_count": 0,
+                "fallback_used": False,
+            },
+        }
+    )
+
+
+@app.post("/pdf-stats")
+async def pdf_stats(file: UploadFile = File(...)) -> JSONResponse:
+    """Cheap routing heuristic: is this PDF text-dominant or image-rich?
+
+    Returns raw facts (pages, image_count, per-page densities, text length)
+    plus a `recommend` field. The n8n IF makes the final call with a
+    tunable threshold so the route can be retuned without rebuilding.
+
+    Routing intent:
+      - text-dominant / scanned text  -> docling-serve (local, 0 cost)
+      - figure/diagram-rich (images we want INTERPRETED) -> Mistral OCR (paid)
+      - unparseable here -> docling (safe cheap default, never default-to-paid)
+    """
+    import io
+
+    raw = await file.read()
+    if len(raw) > MAX_PDF_BYTES:
+        raise HTTPException(
+            status_code=413, detail=f"pdf too large: {len(raw)} bytes"
+        )
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty file")
+
+    try:
+        reader = PdfReader(io.BytesIO(raw))
+        total_pages = len(reader.pages)
+        # Evenly-spaced indices across the WHOLE document so figures that
+        # only appear late (after a textual cover/TOC) are still sampled.
+        if total_pages <= PDF_STATS_SAMPLE_PAGES:
+            indices = list(range(total_pages))
+        else:
+            step = total_pages / PDF_STATS_SAMPLE_PAGES
+            indices = sorted(
+                {int(i * step) for i in range(PDF_STATS_SAMPLE_PAGES)}
+            )
+        sampled = len(indices) or 1
+        text_chars = 0
+        image_count = 0
+        for idx in indices:
+            page = reader.pages[idx]
+            try:
+                text_chars += len((page.extract_text() or "").strip())
+            except Exception:  # noqa: BLE001 — a bad page must not 500 the route
+                pass
+            try:
+                image_count += len(page.images)
+            except Exception:  # noqa: BLE001
+                pass
+
+        images_per_page = round(image_count / sampled, 3)
+        text_chars_per_page = round(text_chars / sampled, 1)
+
+        # Decide on per-page image DENSITY, not raw count: a scanned book of
+        # N pages has image_count==N (≈1 full-page image/page) and must stay
+        # on free docling+OCR. Only a genuinely figure-dense document
+        # (several distinct images per page) is worth paid Mistral image
+        # interpretation. text_chars is intentionally NOT a gate here —
+        # gating on "little text" is exactly what mis-routed scans before.
+        recommend = (
+            "mistral"
+            if images_per_page >= MISTRAL_IMAGES_PER_PAGE_THRESHOLD
+            else "docling"
+        )
+        return JSONResponse(
+            {
+                "pages": total_pages,
+                "sampled_pages": sampled,
+                "image_count": image_count,
+                "images_per_page": images_per_page,
+                "text_chars": text_chars,
+                "text_chars_per_page": text_chars_per_page,
+                "recommend": recommend,
+                "parse_error": None,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 — encrypted/corrupt PDF
+        log.warning("pdf-stats parse failed, defaulting to docling: %s", exc)
+        return JSONResponse(
+            {
+                "pages": 0,
+                "sampled_pages": 0,
+                "image_count": 0,
+                "images_per_page": 0,
+                "text_chars": 0,
+                "text_chars_per_page": 0,
+                "recommend": "docling",
+                "parse_error": str(exc)[:200],
+            }
+        )
+
+
+def _epub_metadata(raw: bytes) -> tuple[dict[str, Any] | None, str]:
+    """Best-effort title/creator/language from the epub OPF. Never raises."""
+    try:
+        import io
+
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            container = zf.read("META-INF/container.xml")
+            cns = {"c": "urn:oasis:names:tc:opendocument:xmlns:container"}
+            opf_path = ET.fromstring(container).find(
+                ".//c:rootfile", cns
+            ).attrib["full-path"]
+            opf = ET.fromstring(zf.read(opf_path))
+            dc = "{http://purl.org/dc/elements/1.1/}"
+            meta: dict[str, Any] = {}
+            for tag in ("title", "creator", "language", "publisher", "date"):
+                el = opf.find(f".//{dc}{tag}")
+                if el is not None and (el.text or "").strip():
+                    meta[tag] = el.text.strip()
+        if not meta:
+            return None, ""
+        human = "\n".join(f"- {k}: {v}" for k, v in meta.items())
+        return meta, human
+    except Exception as exc:  # noqa: BLE001 — metadata is optional, never fatal
+        log.warning("epub metadata extraction failed: %s", exc)
+        return None, ""
 
 
 def _safe_filename(name: str) -> str:

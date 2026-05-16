@@ -104,5 +104,91 @@ def test_bad_frontmatter_falls_back_instead_of_500() -> None:
     assert "#yaml-strict" in data["tags_inline"]
 
 
+def _make_epub() -> bytes:
+    """Build a minimal valid EPUB2 in memory (title/creator + one chapter)."""
+    import io
+    import zipfile
+
+    container = (
+        '<?xml version="1.0"?>'
+        '<container version="1.0" '
+        'xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+        "<rootfiles><rootfile full-path=\"content.opf\" "
+        'media-type="application/oebps-package+xml"/></rootfiles></container>'
+    )
+    opf = (
+        '<?xml version="1.0"?>'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="2.0" '
+        'unique-identifier="id">'
+        '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        "<dc:title>Le Test Sandokai</dc:title>"
+        "<dc:creator>Denis Crozet</dc:creator>"
+        "<dc:language>fr</dc:language>"
+        '<dc:identifier id="id">urn:uuid:test</dc:identifier>'
+        "</metadata>"
+        '<manifest><item id="c1" href="ch1.xhtml" '
+        'media-type="application/xhtml+xml"/></manifest>'
+        '<spine><itemref idref="c1"/></spine></package>'
+    )
+    chapter = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Ch1</title>'
+        "</head><body><h1>Chapitre Un</h1>"
+        "<p>Le bleu n'est pas le vert. Commentaires épars.</p>"
+        "</body></html>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # mimetype must be the first entry and stored uncompressed.
+        zf.writestr(
+            zipfile.ZipInfo("mimetype"),
+            "application/epub+zip",
+            compress_type=zipfile.ZIP_STORED,
+        )
+        zf.writestr("META-INF/container.xml", container)
+        zf.writestr("content.opf", opf)
+        zf.writestr("ch1.xhtml", chapter)
+    return buf.getvalue()
+
+
+def test_epub_converts_to_markdown_via_pandoc() -> None:
+    """epub -> GFM markdown + OPF metadata, same contract as /convert."""
+    resp = requests.post(
+        f"{BASE_URL}/convert-epub",
+        files={"file": ("book.epub", _make_epub(), "application/epub+zip")},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    assert "Chapitre Un" in data["content"]
+    assert "bleu" in data["content"]
+    assert data["frontmatter"]["title"] == "Le Test Sandokai"
+    assert data["frontmatter"]["creator"] == "Denis Crozet"
+    assert "title: Le Test Sandokai" in data["frontmatter_text"]
+    assert data["wikilinks_out"] == []
+    assert data["tags_inline"] == []
+    assert data["stats"]["output_bytes"] > 0
+    assert data["stats"]["fallback_used"] is False
+
+
+def test_empty_epub_is_400() -> None:
+    resp = requests.post(
+        f"{BASE_URL}/convert-epub",
+        files={"file": ("empty.epub", b"", "application/epub+zip")},
+        timeout=10,
+    )
+    assert resp.status_code == 400
+
+
+def test_garbage_epub_is_422() -> None:
+    """A non-epub blob must fail loud (422) so the n8n pipeline counts it."""
+    resp = requests.post(
+        f"{BASE_URL}/convert-epub",
+        files={"file": ("bad.epub", b"not a real epub at all", "application/epub+zip")},
+        timeout=15,
+    )
+    assert resp.status_code == 422
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-xvs"]))
