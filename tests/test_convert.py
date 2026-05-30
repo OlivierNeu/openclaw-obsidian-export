@@ -139,7 +139,8 @@ def _make_epub() -> bytes:
         '<span id="page_1"></span>'
         '<img src="images/cover.jpeg" class="calibre5" />'
         "<p>Le bleu n'est pas le vert. "
-        '<a href="#frag" class="hlink">Voir Figure 1</a>. Commentaires épars.</p>'
+        '<a href="#frag" class="hlink">Voir Figure 1</a>. '
+        "Vernassier &amp; Carrette &gt; analyse. Commentaires épars.</p>"
         "</div></body></html>"
     )
     buf = io.BytesIO()
@@ -176,6 +177,10 @@ def test_epub_converts_to_markdown_via_pandoc() -> None:
     assert "<img" not in content
     assert "calibre" not in content
     assert "![" not in content
+    # HTML entities decoded (Calibre epubs are riddled with &amp;/&gt;)
+    assert "Vernassier & Carrette > analyse" in content
+    assert "&amp;" not in content
+    assert "&gt;" not in content
     # Cross-ref link text survives (the URL fragment may be dropped/kept)
     assert "Figure 1" in content
     assert data["frontmatter"]["title"] == "Le Test Sandokai"

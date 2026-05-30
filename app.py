@@ -27,6 +27,7 @@ GET /health     liveness probe (always 200 if the process is up and the
 
 from __future__ import annotations
 
+import html
 import logging
 import os
 import re
@@ -50,6 +51,7 @@ log = logging.getLogger("obsidian-export-svc")
 
 OBSIDIAN_EXPORT_BIN = "/usr/local/bin/obsidian-export"
 PANDOC_BIN = "pandoc"
+EPUB_LUA_FILTER = "/app/epub_filter.lua"  # drops cover/toc/landmarks/page-list
 MAX_INPUT_BYTES = 10 * 1024 * 1024  # 10 MB — Obsidian notes are tiny in practice
 # epub reference books (Watzlawick, Mouravieff, ...) are much larger than a
 # note and may embed images. Allow up to 80 MB (Flatten caps Drive at 100 MB).
@@ -267,6 +269,7 @@ async def convert_epub(
                     # `<a class=hlink>` cross-refs). Keeps real prose + native
                     # markdown links/headings. Cuts ~16% noise lines for RAG.
                     "-t", "gfm-raw_html",
+                    "--lua-filter", EPUB_LUA_FILTER,
                     "--wrap=none",
                     "--markdown-headings=atx",
                     "-o", str(out),
@@ -573,12 +576,15 @@ _EPUB_BLANKS_RE = re.compile(r"\n{3,}")
 
 
 def _clean_epub_markdown(text: str) -> str:
-    """Strip residual epub noise left after `pandoc -t gfm-raw_html`.
+    """Strip residual epub noise left after `pandoc -t gfm-raw_html` + filter.
 
-    Removes standalone unresolvable image refs and any stray inline HTML
-    tag, then collapses the blank lines the removals leave behind. Native
-    markdown (headings, lists, emphasis, links) is untouched.
+    Order matters: decode HTML entities FIRST (Calibre epubs are riddled
+    with `&amp;`/`&gt;`), then drop unresolvable image refs and stray inline
+    HTML tags, then collapse the blank lines the removals leave behind.
+    Native markdown (headings, lists, emphasis, links) is untouched.
+    `html.unescape` handles the full entity set in one robust pass.
     """
+    text = html.unescape(text)
     text = _EPUB_IMAGE_LINE_RE.sub("", text)
     text = _EPUB_RESIDUAL_TAG_RE.sub("", text)
     text = _EPUB_BLANKS_RE.sub("\n\n", text)

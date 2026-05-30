@@ -65,6 +65,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py /app/app.py
+COPY epub_filter.lua /app/epub_filter.lua
 
 # Non-root user. n8n calls us over the docker bridge, no need for root.
 RUN useradd --create-home --shell /bin/bash --uid 10001 app \
