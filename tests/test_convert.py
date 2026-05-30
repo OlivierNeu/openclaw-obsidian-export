@@ -190,5 +190,44 @@ def test_garbage_epub_is_422() -> None:
     assert resp.status_code == 422
 
 
+def test_persist_md_writes_file_with_frontmatter() -> None:
+    """Smoke: POST /persist-md returns a path + writes YAML frontmatter."""
+    md5 = "abcdef0123456789abcdef0123456789"
+    body = {
+        "owner": "jerome",
+        "md5": md5,
+        "fileName": "Smoke: persist test.epub",
+        "fileUrl": "https://drive.google.com/file/d/FAKE/view",
+        "fileId": "FAKE",
+        "fileMimeType": "application/epub+zip",
+        "converter": "epub",
+        "content": "# Title\n\nVerbatim content.\n",
+    }
+    resp = requests.post(f"{BASE_URL}/persist-md", json=body, timeout=10)
+    resp.raise_for_status()
+    out = resp.json()
+    assert out["filename"].endswith(f"--{md5}.md")
+    assert "Smoke_ persist test" in out["filename"] or "Smoke persist test" in out["filename"]
+    assert "/jerome/" in out["path"]
+
+
+def test_persist_md_rejects_invalid_owner() -> None:
+    resp = requests.post(
+        f"{BASE_URL}/persist-md",
+        json={"owner": "../etc", "md5": "a" * 32, "content": "x", "fileName": "x"},
+        timeout=5,
+    )
+    assert resp.status_code == 400
+
+
+def test_persist_md_rejects_empty_content() -> None:
+    resp = requests.post(
+        f"{BASE_URL}/persist-md",
+        json={"owner": "jerome", "md5": "a" * 32, "content": "   "},
+        timeout=5,
+    )
+    assert resp.status_code == 400
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-xvs"]))

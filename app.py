@@ -61,6 +61,10 @@ MAX_PDF_BYTES = 100 * 1024 * 1024
 # N): a long PDF with a textual cover/TOC and figures only after page 30
 # must still be seen as figure-rich.
 PDF_STATS_SAMPLE_PAGES = 40
+# Where /persist-md writes verbatim markdown caches. Host bind-mount via
+# docker-compose; see openclaw-notes/docker-compose.yml.
+KNOWLEDGE_MD_ROOT = Path("/data/knowledge-md")
+MAX_PERSIST_NAME_LEN = 180   # leaves room for "--{md5=32}.md" within FS limits
 # Route to Mistral only when images are DENSE per page (figures/diagrams the
 # RAG must interpret). A scanned document is ≈1 full-page image per page —
 # that is NOT this case: docling+OCR handles scans locally for free. Using a
@@ -402,6 +406,92 @@ async def pdf_stats(file: UploadFile = File(...)) -> JSONResponse:
                 "parse_error": str(exc)[:200],
             }
         )
+
+
+@app.post("/persist-md")
+async def persist_md(payload: dict[str, Any]) -> JSONResponse:
+    """Persist a converted markdown to the NAS verbatim cache.
+
+    Lets the agent quote / grep / open in Obsidian the actual source
+    extract of a LightRAG-indexed document. The file is a flat .md with a
+    YAML frontmatter carrying every Drive metadata field so traceability
+    survives outside LightRAG. Identity = `<safe-name>--<md5>.md` so a
+    human can browse by name AND lookup by md5 via shell glob.
+
+    The pipeline calls this in a fire-and-forget Code node — persistence
+    failure must NOT block ingestion (LightRAG remains the source of
+    truth; this is a derived cache).
+    """
+    owner = str(payload.get("owner", "")).strip()
+    if not owner or not re.match(r"^[a-z0-9][a-z0-9_\-]{0,30}$", owner):
+        raise HTTPException(status_code=400, detail="invalid 'owner'")
+    md5 = str(payload.get("md5", "")).strip().lower()
+    if not re.match(r"^[a-f0-9]{8,64}$", md5):
+        raise HTTPException(status_code=400, detail="invalid 'md5'")
+    content = payload.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise HTTPException(status_code=400, detail="empty 'content'")
+
+    file_name = payload.get("fileName") or "doc"
+    safe = _safe_persist_name(file_name)
+    filename = f"{safe}--{md5}.md"
+
+    owner_dir = KNOWLEDGE_MD_ROOT / owner
+    owner_dir.mkdir(parents=True, exist_ok=True)
+    target = owner_dir / filename
+
+    frontmatter_fields = [
+        ("fileId", payload.get("fileId")),
+        ("fileName", file_name),
+        ("fileUrl", payload.get("fileUrl")),
+        ("fileMimeType", payload.get("fileMimeType")),
+        ("fileExtension", payload.get("fileExtension")),
+        ("fileSize", payload.get("fileSize")),
+        ("fileCreatedTime", payload.get("fileCreatedTime")),
+        ("fileModifiedTime", payload.get("fileModifiedTime")),
+        ("fileOwner", payload.get("fileOwner")),
+        ("fileOwnerEmail", payload.get("fileOwnerEmail")),
+        ("md5", md5),
+        ("owner", owner),
+        ("converter", payload.get("converter")),
+        ("ingestedAt", payload.get("ingestedAt")),
+    ]
+    lines = ["---"]
+    for k, v in frontmatter_fields:
+        if v is None or v == "":
+            continue
+        # Always-quoted scalar: safe under any value (colons, hashes, etc).
+        s = str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").strip()
+        lines.append(f'{k}: "{s}"')
+    lines.append("---")
+    lines.append("")
+    body = "\n".join(lines) + content.rstrip() + "\n"
+
+    # Atomic write so a concurrent reader never sees a half-written file.
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(body, encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o644)
+    except OSError:
+        pass
+    tmp.replace(target)
+
+    return JSONResponse(
+        {
+            "path": str(target),
+            "filename": filename,
+            "bytes": len(body.encode("utf-8")),
+        }
+    )
+
+
+def _safe_persist_name(name: str) -> str:
+    """Sanitise a Drive filename for filesystem use, preserving readability."""
+    base = Path(name).stem if "." in name else name
+    base = re.sub(r"[^A-Za-z0-9._\- ]", "_", base).strip()
+    base = re.sub(r"\s+", " ", base)
+    base = re.sub(r"_+", "_", base)
+    return (base or "doc")[:MAX_PERSIST_NAME_LEN]
 
 
 def _epub_metadata(raw: bytes) -> tuple[dict[str, Any] | None, str]:
