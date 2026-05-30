@@ -229,5 +229,55 @@ def test_persist_md_rejects_empty_content() -> None:
     assert resp.status_code == 400
 
 
+def test_cache_list_then_archive_roundtrip() -> None:
+    """persist a file, see it in /cache-list, archive it, see it gone."""
+    md5 = "1234567890abcdef1234567890abcdef"
+    persist = requests.post(
+        f"{BASE_URL}/persist-md",
+        json={
+            "owner": "jerome",
+            "md5": md5,
+            "fileName": "Roundtrip doc.pdf",
+            "content": "# Roundtrip\n\nbody\n",
+        },
+        timeout=10,
+    )
+    persist.raise_for_status()
+    fname = persist.json()["filename"]
+
+    listed = requests.get(f"{BASE_URL}/cache-list", params={"owner": "jerome"}, timeout=10)
+    listed.raise_for_status()
+    md5s = {f["md5"] for f in listed.json()["files"]}
+    assert md5 in md5s
+
+    arch = requests.post(
+        f"{BASE_URL}/cache-archive",
+        json={"owner": "jerome", "filenames": [fname]},
+        timeout=10,
+    )
+    arch.raise_for_status()
+    assert arch.json()["archived"] == 1
+
+    listed2 = requests.get(f"{BASE_URL}/cache-list", params={"owner": "jerome"}, timeout=10)
+    listed2.raise_for_status()
+    md5s2 = {f["md5"] for f in listed2.json()["files"]}
+    assert md5 not in md5s2  # moved to _archive/, no longer live
+
+
+def test_cache_archive_blocks_path_traversal() -> None:
+    resp = requests.post(
+        f"{BASE_URL}/cache-archive",
+        json={"owner": "jerome", "filenames": ["../../../etc/passwd"]},
+        timeout=5,
+    )
+    resp.raise_for_status()
+    assert resp.json()["archived"] == 0
+
+
+def test_cache_list_rejects_invalid_owner() -> None:
+    resp = requests.get(f"{BASE_URL}/cache-list", params={"owner": "../x"}, timeout=5)
+    assert resp.status_code == 400
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-xvs"]))

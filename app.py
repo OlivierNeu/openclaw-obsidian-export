@@ -65,6 +65,9 @@ PDF_STATS_SAMPLE_PAGES = 40
 # docker-compose; see openclaw-notes/docker-compose.yml.
 KNOWLEDGE_MD_ROOT = Path("/data/knowledge-md")
 MAX_PERSIST_NAME_LEN = 180   # leaves room for "--{md5=32}.md" within FS limits
+ARCHIVE_DIRNAME = "_archive"  # orphan verbatim files are MOVED here, not deleted
+# Trailing md5 in a cache filename: "<name>--<md5>.md".
+CACHE_MD5_RE = re.compile(r"--([a-f0-9]{8,64})\.md$")
 # Route to Mistral only when images are DENSE per page (figures/diagrams the
 # RAG must interpret). A scanned document is ≈1 full-page image per page —
 # that is NOT this case: docling+OCR handles scans locally for free. Using a
@@ -492,6 +495,65 @@ def _safe_persist_name(name: str) -> str:
     base = re.sub(r"\s+", " ", base)
     base = re.sub(r"_+", "_", base)
     return (base or "doc")[:MAX_PERSIST_NAME_LEN]
+
+
+@app.get("/cache-list")
+def cache_list(owner: str) -> JSONResponse:
+    """List the verbatim cache for an owner: every live (non-archived) .md
+    with the md5 parsed from its filename. Drives the reconciliation
+    workflow's level-2 diff (cache vs Drive-live). Filename-only — no file
+    reads — so it stays cheap even at several thousand files.
+    """
+    if not re.match(r"^[a-z0-9][a-z0-9_\-]{0,30}$", owner):
+        raise HTTPException(status_code=400, detail="invalid 'owner'")
+    owner_dir = KNOWLEDGE_MD_ROOT / owner
+    files = []
+    if owner_dir.is_dir():
+        for entry in owner_dir.iterdir():
+            if entry.is_dir():
+                continue  # skips _archive/
+            m = CACHE_MD5_RE.search(entry.name)
+            if not m:
+                continue
+            files.append({"filename": entry.name, "md5": m.group(1)})
+    return JSONResponse({"owner": owner, "count": len(files), "files": files})
+
+
+@app.post("/cache-archive")
+async def cache_archive(payload: dict[str, Any]) -> JSONResponse:
+    """Move orphan cache files into <owner>/_archive/ (tombstone, not delete).
+
+    Called by the reconciliation workflow for files whose md5 is no longer
+    on the Drive. Idempotent: a filename already gone / already archived is
+    silently counted as done. Path-traversal is blocked (basename only).
+    """
+    owner = str(payload.get("owner", "")).strip()
+    if not re.match(r"^[a-z0-9][a-z0-9_\-]{0,30}$", owner):
+        raise HTTPException(status_code=400, detail="invalid 'owner'")
+    filenames = payload.get("filenames")
+    if not isinstance(filenames, list):
+        raise HTTPException(status_code=400, detail="'filenames' must be a list")
+
+    owner_dir = KNOWLEDGE_MD_ROOT / owner
+    archive_dir = owner_dir / ARCHIVE_DIRNAME
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    archived, skipped = [], []
+    for raw_name in filenames:
+        name = Path(str(raw_name)).name  # basename only — no traversal
+        if not name or not CACHE_MD5_RE.search(name):
+            skipped.append(str(raw_name))
+            continue
+        src = owner_dir / name
+        if not src.is_file():
+            skipped.append(name)  # already gone / already archived
+            continue
+        src.replace(archive_dir / name)
+        archived.append(name)
+
+    return JSONResponse(
+        {"owner": owner, "archived": len(archived), "skipped": len(skipped)}
+    )
 
 
 def _epub_metadata(raw: bytes) -> tuple[dict[str, Any] | None, str]:
