@@ -130,12 +130,17 @@ def _make_epub() -> bytes:
         'media-type="application/xhtml+xml"/></manifest>'
         '<spine><itemref idref="c1"/></spine></package>'
     )
+    # Includes Calibre-style noise (empty page-anchor span, img, hlink) that
+    # the cleanup must strip while keeping the prose.
     chapter = (
         '<?xml version="1.0" encoding="utf-8"?>'
         '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Ch1</title>'
-        "</head><body><h1>Chapitre Un</h1>"
-        "<p>Le bleu n'est pas le vert. Commentaires épars.</p>"
-        "</body></html>"
+        '</head><body><div class="calibre1"><h1>Chapitre Un</h1>'
+        '<span id="page_1"></span>'
+        '<img src="images/cover.jpeg" class="calibre5" />'
+        "<p>Le bleu n'est pas le vert. "
+        '<a href="#frag" class="hlink">Voir Figure 1</a>. Commentaires épars.</p>'
+        "</div></body></html>"
     )
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -160,8 +165,19 @@ def test_epub_converts_to_markdown_via_pandoc() -> None:
     )
     resp.raise_for_status()
     data = resp.json()
-    assert "Chapitre Un" in data["content"]
-    assert "bleu" in data["content"]
+    content = data["content"]
+    # Prose preserved
+    assert "Chapitre Un" in content
+    assert "bleu" in content
+    assert "Commentaires épars" in content
+    # Noise stripped: no raw HTML tag, no empty anchor span, no image ref
+    assert "<span" not in content
+    assert "<div" not in content
+    assert "<img" not in content
+    assert "calibre" not in content
+    assert "![" not in content
+    # Cross-ref link text survives (the URL fragment may be dropped/kept)
+    assert "Figure 1" in content
     assert data["frontmatter"]["title"] == "Le Test Sandokai"
     assert data["frontmatter"]["creator"] == "Denis Crozet"
     assert "title: Le Test Sandokai" in data["frontmatter_text"]

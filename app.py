@@ -261,7 +261,12 @@ async def convert_epub(
                     PANDOC_BIN,
                     str(src),
                     "-f", "epub",
-                    "-t", "gfm",
+                    # gfm-raw_html: drop raw HTML passthrough that Calibre-built
+                    # epubs carry (empty `<span id=page_N>` anchors, `<div
+                    # class=calibreN>` wrappers, `<svg>`/`<img>` cover markup,
+                    # `<a class=hlink>` cross-refs). Keeps real prose + native
+                    # markdown links/headings. Cuts ~16% noise lines for RAG.
+                    "-t", "gfm-raw_html",
                     "--wrap=none",
                     "--markdown-headings=atx",
                     "-o", str(out),
@@ -288,7 +293,9 @@ async def convert_epub(
             raise HTTPException(
                 status_code=422, detail="pandoc produced no output for this epub"
             )
-        content = out.read_text(encoding="utf-8", errors="replace").strip()
+        content = _clean_epub_markdown(
+            out.read_text(encoding="utf-8", errors="replace")
+        )
 
     if not content:
         # A valid-looking epub that yields no text (DRM, images-only, broken
@@ -554,6 +561,28 @@ async def cache_archive(payload: dict[str, Any]) -> JSONResponse:
     return JSONResponse(
         {"owner": owner, "archived": len(archived), "skipped": len(skipped)}
     )
+
+
+# Standalone image line: `![alt](src)` alone on a line — epub cover/figure
+# refs that point to unresolvable image paths, useless in a text verbatim.
+_EPUB_IMAGE_LINE_RE = re.compile(r"(?m)^[ \t]*!\[[^\]]*\]\([^)]*\)[ \t]*$")
+# Any residual inline raw HTML tag pandoc may still emit (e.g. <sup>, <br>).
+_EPUB_RESIDUAL_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+# 3+ consecutive blank lines -> 1 (gfm-raw_html removal leaves gaps).
+_EPUB_BLANKS_RE = re.compile(r"\n{3,}")
+
+
+def _clean_epub_markdown(text: str) -> str:
+    """Strip residual epub noise left after `pandoc -t gfm-raw_html`.
+
+    Removes standalone unresolvable image refs and any stray inline HTML
+    tag, then collapses the blank lines the removals leave behind. Native
+    markdown (headings, lists, emphasis, links) is untouched.
+    """
+    text = _EPUB_IMAGE_LINE_RE.sub("", text)
+    text = _EPUB_RESIDUAL_TAG_RE.sub("", text)
+    text = _EPUB_BLANKS_RE.sub("\n\n", text)
+    return text.strip()
 
 
 def _epub_metadata(raw: bytes) -> tuple[dict[str, Any] | None, str]:
